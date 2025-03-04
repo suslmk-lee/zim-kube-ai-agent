@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k8s-ai-agent-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # 필요한 경우 추가 어노테이션 설정
+    # kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  - host: k8s-ai-agent.example.com  # 실제 도메인으로 변경
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: k8s-ai-agent
+            port:
+              number: 80
