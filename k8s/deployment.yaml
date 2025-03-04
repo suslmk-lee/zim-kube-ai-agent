@@ -18,7 +18,7 @@ spec:
       serviceAccountName: k8s-ai-agent-sa
       containers:
       - name: k8s-ai-agent
-        image: k8s-ai-agent:latest
+        image: 44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry/k8s-ai-agent:latest
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
@@ -58,4 +58,4 @@ spec:
   ports:
   - port: 80
     targetPort: 8000
-  type: ClusterIP
+  type: NodePort
