@@ -122,6 +122,22 @@ class K8sOperations:
             }
         }
     
+    def get_deployment_description(self, name, namespace):
+        """
+        Get a detailed description of a deployment.
+        
+        Args:
+            name: Name of the deployment
+            namespace: Namespace containing the deployment
+            
+        Returns:
+            Dictionary with detailed deployment information
+        """
+        try:
+            return self.client.get_deployment_description(name, namespace)
+        except Exception as e:
+            return {"error": f"Failed to get deployment description: {str(e)}"}
+    
     def scale_deployment(self, namespace, deployment_name, scale_factor):
         """
         Scale a deployment by the specified factor.
@@ -155,3 +171,18 @@ class K8sOperations:
             "new_replicas": new_replicas,
             "scale_factor": scale_factor
         }
+    
+    def create_namespace(self, name):
+        """
+        Create a new namespace.
+        
+        Args:
+            name: Name of the namespace to create
+            
+        Returns:
+            Dictionary with namespace information or error message
+        """
+        try:
+            return self.client.create_namespace(name)
+        except Exception as e:
+            return {"error": f"Failed to create namespace: {str(e)}"}

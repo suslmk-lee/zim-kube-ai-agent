@@ -81,6 +81,152 @@ class K8sClient:
                 raise Exception(f"Deployment '{name}' not found in namespace '{namespace}'")
             raise Exception(f"Error getting deployment: {str(e)}")
     
+    def get_deployment_description(self, name, namespace):
+        """
+        Get a detailed description of a deployment.
+        
+        Args:
+            name: Name of the deployment
+            namespace: Namespace containing the deployment
+            
+        Returns:
+            Dictionary with detailed deployment information
+        """
+        try:
+            # Get the deployment
+            deployment = self.apps_v1.read_namespaced_deployment(name, namespace)
+            
+            # Get the replica sets associated with this deployment
+            selector = ""
+            for k, v in deployment.spec.selector.match_labels.items():
+                selector += f"{k}={v},"
+            selector = selector.rstrip(",")
+            
+            replica_sets = self.apps_v1.list_namespaced_replica_set(
+                namespace, 
+                label_selector=selector
+            )
+            
+            # Get the pods associated with this deployment
+            pods = self.core_v1.list_namespaced_pod(
+                namespace,
+                label_selector=selector
+            )
+            
+            # Get events related to this deployment
+            field_selector = f"involvedObject.name={name},involvedObject.namespace={namespace}"
+            events = self.core_v1.list_namespaced_event(
+                namespace,
+                field_selector=field_selector
+            )
+            
+            # Format the deployment description
+            description = {
+                "name": deployment.metadata.name,
+                "namespace": deployment.metadata.namespace,
+                "creation_timestamp": deployment.metadata.creation_timestamp.isoformat() if deployment.metadata.creation_timestamp else None,
+                "labels": deployment.metadata.labels,
+                "annotations": deployment.metadata.annotations,
+                "selector": deployment.spec.selector.match_labels,
+                "replicas": {
+                    "desired": deployment.spec.replicas,
+                    "current": deployment.status.replicas,
+                    "updated": deployment.status.updated_replicas,
+                    "available": deployment.status.available_replicas,
+                    "unavailable": deployment.status.unavailable_replicas
+                },
+                "strategy": {
+                    "type": deployment.spec.strategy.type,
+                    "rolling_update": {
+                        "max_surge": deployment.spec.strategy.rolling_update.max_surge if deployment.spec.strategy.rolling_update else None,
+                        "max_unavailable": deployment.spec.strategy.rolling_update.max_unavailable if deployment.spec.strategy.rolling_update else None
+                    } if deployment.spec.strategy.rolling_update else None
+                },
+                "containers": [],
+                "conditions": [
+                    {
+                        "type": condition.type,
+                        "status": condition.status,
+                        "reason": condition.reason,
+                        "message": condition.message,
+                        "last_update": condition.last_update_time.isoformat() if condition.last_update_time else None
+                    }
+                    for condition in deployment.status.conditions or []
+                ],
+                "replica_sets": [
+                    {
+                        "name": rs.metadata.name,
+                        "replicas": rs.status.replicas,
+                        "ready_replicas": rs.status.ready_replicas
+                    }
+                    for rs in replica_sets.items
+                ],
+                "pods": [
+                    {
+                        "name": pod.metadata.name,
+                        "status": pod.status.phase,
+                        "ready": all(container.ready for container in pod.status.container_statuses) if pod.status.container_statuses else False,
+                        "restart_count": sum(container.restart_count for container in pod.status.container_statuses) if pod.status.container_statuses else 0,
+                        "node": pod.spec.node_name,
+                        "ip": pod.status.pod_ip
+                    }
+                    for pod in pods.items
+                ],
+                "events": [
+                    {
+                        "type": event.type,
+                        "reason": event.reason,
+                        "message": event.message,
+                        "count": event.count,
+                        "first_timestamp": event.first_timestamp.isoformat() if event.first_timestamp else None,
+                        "last_timestamp": event.last_timestamp.isoformat() if event.last_timestamp else None
+                    }
+                    for event in events.items
+                ]
+            }
+            
+            # Add container information
+            for container in deployment.spec.template.spec.containers:
+                container_info = {
+                    "name": container.name,
+                    "image": container.image,
+                    "ports": [
+                        {
+                            "name": port.name,
+                            "container_port": port.container_port,
+                            "protocol": port.protocol
+                        }
+                        for port in container.ports or []
+                    ],
+                    "resources": {
+                        "limits": container.resources.limits if container.resources and container.resources.limits else {},
+                        "requests": container.resources.requests if container.resources and container.resources.requests else {}
+                    },
+                    "liveness_probe": bool(container.liveness_probe),
+                    "readiness_probe": bool(container.readiness_probe),
+                    "env": [
+                        {
+                            "name": env.name,
+                            "value": env.value if env.value else "(from secret or configmap)"
+                        }
+                        for env in container.env or []
+                    ],
+                    "volume_mounts": [
+                        {
+                            "name": volume.name,
+                            "mount_path": volume.mount_path,
+                            "read_only": volume.read_only
+                        }
+                        for volume in container.volume_mounts or []
+                    ] if container.volume_mounts else []
+                }
+                description["containers"].append(container_info)
+            
+            return description
+            
+        except Exception as e:
+            return {"error": f"Failed to get deployment description: {str(e)}"}
+    
     def scale_deployment(self, name, namespace, replicas):
         """Scale a deployment to the specified number of replicas."""
         try:
@@ -140,3 +286,38 @@ class K8sClient:
         except ApiException as e:
             # The metrics API might not be available
             raise Exception(f"Error getting pod metrics: {str(e)}")
+    
+    def create_namespace(self, name):
+        """
+        Create a new namespace.
+        
+        Args:
+            name: Name of the namespace to create
+            
+        Returns:
+            Dictionary with namespace information or error message
+        """
+        try:
+            # Create namespace object
+            from kubernetes.client.models.v1_namespace import V1Namespace
+            from kubernetes.client.models.v1_object_meta import V1ObjectMeta
+            
+            namespace = V1Namespace(
+                metadata=V1ObjectMeta(
+                    name=name
+                )
+            )
+            
+            # Create the namespace
+            result = self.core_v1.create_namespace(namespace)
+            
+            return {
+                "name": result.metadata.name,
+                "status": result.status.phase,
+                "creation_time": result.metadata.creation_timestamp.isoformat() if result.metadata.creation_timestamp else None
+            }
+            
+        except Exception as e:
+            if "AlreadyExists" in str(e):
+                return {"error": f"Namespace '{name}' already exists"}
+            return {"error": f"Failed to create namespace: {str(e)}"}

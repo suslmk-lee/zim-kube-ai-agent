@@ -39,47 +39,51 @@ class K8sAgent:
             openai_api_key=openai_api_key
         )
         
-        # Initialize conversation memory
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
+        # Initialize conversation memory using the updated approach
+        from langchain_core.messages import HumanMessage, AIMessage
+        from langchain_core.runnables.history import RunnableWithMessageHistory
+        
+        self.chat_history = []
         
         # Define the prompt template for query classification
         self.classify_prompt = PromptTemplate(
             input_variables=["query", "chat_history"],
             template="""
-            You are an AI assistant that classifies user queries about Kubernetes resources.
+            You are a query classifier for a Kubernetes AI agent. Your task is to classify the user's query into one of the following categories:
             
-            Based on the following query and chat history, determine the type of operation the user wants to perform.
-            
-            Chat History:
-            {chat_history}
-            
-            User Query: "{query}"
-            
-            Classify the query into ONE of the following categories:
-            1. GET_NAMESPACE_INFO - User wants information about namespaces
+            1. GET_NAMESPACE_INFO - User wants to get information about namespaces in a cluster
             2. GET_RESOURCE_USAGE - User wants to know which pods or deployments are using the most resources
             3. SCALE_DEPLOYMENT - User wants to scale a deployment
-            4. UNKNOWN - User query doesn't match any of the above categories
+            4. VISUALIZE_RESOURCES - User wants to visualize relationships between resources in a namespace
+            5. DESCRIBE_DEPLOYMENT - User wants to describe a deployment
+            6. CREATE_NAMESPACE - User wants to create a new namespace
+            7. UNKNOWN - User query doesn't match any of the above categories
+            
+            Pay special attention to CREATE_NAMESPACE requests. If the user asks to create, make, or establish a new namespace, classify it as CREATE_NAMESPACE.
             
             For GET_NAMESPACE_INFO, extract the cluster name if mentioned.
             For GET_RESOURCE_USAGE, extract the namespace name.
             For SCALE_DEPLOYMENT, extract the namespace, deployment name, and scale factor.
+            For VISUALIZE_RESOURCES, extract the namespace name.
+            For DESCRIBE_DEPLOYMENT, extract the namespace and deployment name.
+            For CREATE_NAMESPACE, extract the namespace name to create.
             
             Return your response in the following JSON format:
             {{
                 "category": "CATEGORY_NAME",
                 "parameters": {{
                     "cluster_name": "extracted_cluster_name",  // Only for GET_NAMESPACE_INFO
-                    "namespace": "extracted_namespace",  // For GET_RESOURCE_USAGE and SCALE_DEPLOYMENT
-                    "deployment_name": "extracted_deployment_name",  // Only for SCALE_DEPLOYMENT
+                    "namespace": "extracted_namespace",  // For GET_RESOURCE_USAGE, SCALE_DEPLOYMENT, VISUALIZE_RESOURCES, DESCRIBE_DEPLOYMENT, and CREATE_NAMESPACE
+                    "deployment_name": "extracted_deployment_name",  // Only for SCALE_DEPLOYMENT and DESCRIBE_DEPLOYMENT
                     "scale_factor": 2.0  // Only for SCALE_DEPLOYMENT, numeric value
                 }}
             }}
             
-            Only include parameters that are relevant to the category and that you can extract from the query.
+            User Query: {query}
+            
+            Chat History: {chat_history}
+            
+            Classification:
             """
         )
         
@@ -90,19 +94,58 @@ class K8sAgent:
         self.response_prompt = PromptTemplate(
             input_variables=["query", "result", "chat_history"],
             template="""
-            You are an AI assistant that helps users manage Kubernetes resources.
+            You are an AI assistant for Kubernetes operations. Your task is to respond to user queries about Kubernetes resources based on the provided result.
             
-            Based on the following user query and the result of the operation, generate a helpful response.
+            User Query: {query}
             
-            Chat History:
-            {chat_history}
+            Result: {result}
             
-            User Query: "{query}"
+            Chat History: {chat_history}
             
-            Operation Result: {result}
+            Guidelines:
+            1. Be concise and informative in your response.
+            2. If the result contains an error message, explain the error in a user-friendly way and suggest possible solutions.
+            3. If the result contains data, present it in a clear and organized manner.
+            4. If the result contains deployment description data, format it as markdown tables for better readability.
+            5. For visualization data, explain what the visualization shows.
+            6. Use appropriate Kubernetes terminology.
+            7. Respond in the same language as the user query.
             
-            Generate a concise, informative response that answers the user's query based on the operation result.
-            Explain what was done and provide the key information the user asked for.
+            When formatting deployment description as tables, use the following structure:
+            
+            Basic Info:
+            | Field | Value |
+            |-------|-------|
+            | Name | [name] |
+            | Namespace | [namespace] |
+            | Creation Time | [creation_timestamp] |
+            | Selector | [selector] |
+            
+            Replicas:
+            | Type | Count |
+            |------|-------|
+            | Desired | [desired] |
+            | Current | [current] |
+            | Updated | [updated] |
+            | Available | [available] |
+            | Unavailable | [unavailable] |
+            
+            Containers:
+            | Name | Image | Ports | Resource Requests | Resource Limits |
+            |------|-------|-------|-------------------|----------------|
+            | [name] | [image] | [ports] | [requests] | [limits] |
+            
+            Pods:
+            | Name | Status | Ready | Restarts | Node | IP |
+            |------|--------|-------|----------|------|---|
+            | [pod_name] | [status] | [ready] | [restarts] | [node] | [ip] |
+            
+            Events:
+            | Type | Reason | Message | Count | Last Seen |
+            |------|--------|---------|-------|-----------|
+            | [type] | [reason] | [message] | [count] | [last_seen] |
+            
+            Your response:
             """
         )
         
@@ -111,6 +154,7 @@ class K8sAgent:
         
         # Initialize K8s operations
         self.k8s_ops = K8sOperations()
+        self.k8s_client = K8sOperations()  # Initialize k8s_client
         
         # Initialize Neo4j database and Text2Cypher if needed
         self.use_neo4j = use_neo4j
@@ -140,8 +184,9 @@ class K8sAgent:
         Returns:
             Response to the user's query
         """
-        # Get chat history from memory
-        chat_history = self.memory.load_memory_variables({}).get("chat_history", "")
+        # Get chat history
+        chat_history = "\n".join([f"User: {msg['input']}\nAI: {msg['output']}" 
+                                 for msg in self.chat_history]) if self.chat_history else ""
         
         # Classify the query
         classification_result = self.classify_chain.invoke({"query": query, "chat_history": chat_history})
@@ -158,6 +203,15 @@ class K8sAgent:
                 classification["parameters"].get("deployment_name"),
                 classification["parameters"].get("scale_factor", 2.0)
             )
+        elif classification["category"] == "VISUALIZE_RESOURCES":
+            result = self._handle_visualize_resources(classification["parameters"].get("namespace"))
+        elif classification["category"] == "DESCRIBE_DEPLOYMENT":
+            result = self._handle_describe_deployment(
+                classification["parameters"].get("namespace"),
+                classification["parameters"].get("deployment_name")
+            )
+        elif classification["category"] == "CREATE_NAMESPACE":
+            result = self._handle_create_namespace(classification["parameters"].get("namespace"))
         else:
             result = {"error": "I couldn't understand what you're asking for. Please try rephrasing your query."}
         
@@ -169,10 +223,7 @@ class K8sAgent:
         })
         
         # Save the interaction to memory
-        self.memory.save_context(
-            {"input": query},
-            {"output": response.content}
-        )
+        self.chat_history.append({"input": query, "output": response.content})
         
         return response.content
     
@@ -181,52 +232,44 @@ class K8sAgent:
         Parse the classification result from the LLM.
         
         Args:
-            classification_text: Text containing the classification JSON
+            classification_text: Classification text from the LLM
             
         Returns:
-            Dictionary with the parsed classification
+            Dictionary with category and parameters
         """
-        # Extract JSON from the text using regex
-        json_match = re.search(r'\{.*\}', classification_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(0)
-            try:
-                return json.loads(json_str)
-            except json.JSONDecodeError:
-                pass
-        
-        # Fallback to a simple parsing approach
-        category_match = re.search(r'"category":\s*"([^"]+)"', classification_text)
-        category = category_match.group(1) if category_match else "UNKNOWN"
-        
-        parameters = {}
-        
-        # Extract cluster_name for GET_NAMESPACE_INFO
-        if category == "GET_NAMESPACE_INFO":
-            cluster_match = re.search(r'"cluster_name":\s*"([^"]+)"', classification_text)
-            if cluster_match:
-                parameters["cluster_name"] = cluster_match.group(1)
-        
-        # Extract namespace for GET_RESOURCE_USAGE and SCALE_DEPLOYMENT
-        if category in ["GET_RESOURCE_USAGE", "SCALE_DEPLOYMENT"]:
-            namespace_match = re.search(r'"namespace":\s*"([^"]+)"', classification_text)
-            if namespace_match:
-                parameters["namespace"] = namespace_match.group(1)
-        
-        # Extract deployment_name and scale_factor for SCALE_DEPLOYMENT
-        if category == "SCALE_DEPLOYMENT":
-            deployment_match = re.search(r'"deployment_name":\s*"([^"]+)"', classification_text)
-            if deployment_match:
-                parameters["deployment_name"] = deployment_match.group(1)
+        try:
+            # First try to extract JSON using regex
+            import re
+            import json
             
-            scale_match = re.search(r'"scale_factor":\s*([\d.]+)', classification_text)
-            if scale_match:
-                parameters["scale_factor"] = float(scale_match.group(1))
-        
-        return {
-            "category": category,
-            "parameters": parameters
-        }
+            json_match = re.search(r'\{.*\}', classification_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    pass
+            
+            # If JSON parsing fails, fall back to line-by-line parsing
+            lines = classification_text.strip().split('\n')
+            category = None
+            parameters = {}
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith("Category:") or line.startswith('"category":'):
+                    category_value = line.split(":", 1)[1].strip().strip('"').strip(',')
+                    category = category_value
+                elif ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().strip('"').strip()
+                    value = value.strip().strip('"').strip(',')
+                    parameters[key.lower()] = value
+            
+            return {"category": category, "parameters": parameters}
+        except Exception as e:
+            print(f"Error parsing classification: {str(e)}")
+            return {"category": "UNKNOWN", "parameters": {}}
     
     def _handle_namespace_info(self, cluster_name):
         """
@@ -319,7 +362,7 @@ class K8sAgent:
         
         Args:
             namespace: Name of the namespace
-            deployment_name: Name of the deployment
+            deployment_name: Name of the deployment to scale
             scale_factor: Factor by which to scale the deployment
             
         Returns:
@@ -358,3 +401,230 @@ class K8sAgent:
             })
         
         return result
+    
+    def _handle_visualize_resources(self, namespace):
+        """
+        Handle visualization of resources in a namespace.
+        
+        Args:
+            namespace: The namespace to visualize
+            
+        Returns:
+            Dictionary with visualization data or error message
+        """
+        if not namespace:
+            return {"error": "Namespace not specified. Please provide a namespace name."}
+            
+        if not self.use_neo4j or not self.neo4j_db:
+            return {"error": "Neo4j database is not available. Resource visualization requires Neo4j."}
+            
+        try:
+            # Use the dedicated method in Neo4jDatabase for retrieving namespace resources
+            if hasattr(self.neo4j_db, 'get_namespace_resources'):
+                visualization_data = self.neo4j_db.get_namespace_resources(namespace)
+                if "error" in visualization_data:
+                    return visualization_data
+                
+                return {
+                    "visualization_data": visualization_data,
+                    "message": f"Successfully retrieved resource relationships for namespace '{namespace}'."
+                }
+            
+            # Fallback to direct queries if the method doesn't exist
+            # Query Neo4j for all resources in the namespace and their relationships
+            cypher_query = """
+            MATCH (n:Namespace {name: $namespace})
+            OPTIONAL MATCH (d:Deployment)-[:BELONGS_TO]->(n)
+            OPTIONAL MATCH (p:Pod)-[:BELONGS_TO]->(n)
+            OPTIONAL MATCH (p:Pod)-[:PART_OF]->(d)
+            RETURN n, collect(distinct d) as deployments, collect(distinct p) as pods
+            """
+            
+            result = self.neo4j_db.execute_query(cypher_query, {"namespace": namespace})
+            
+            if not result or not result[0].get('n'):
+                return {"error": f"Namespace '{namespace}' not found in the database."}
+                
+            # Format the result for visualization
+            namespace_data = result[0]
+            
+            # Extract namespace info
+            ns_info = {
+                "name": namespace,
+                "type": "Namespace"
+            }
+            
+            # Extract deployment info
+            deployments = []
+            for d in namespace_data.get('deployments', []):
+                if d:  # Check if deployment is not None
+                    deployment_info = {
+                        "name": d.get("name"),
+                        "type": "Deployment",
+                        "namespace": d.get("namespace"),
+                        "cpu_usage": d.get("cpu_usage"),
+                        "replicas": d.get("replicas")
+                    }
+                    deployments.append(deployment_info)
+            
+            # Extract pod info with relationships to deployments
+            pods = []
+            pod_relationships = []
+            for p in namespace_data.get('pods', []):
+                if p:  # Check if pod is not None
+                    pod_info = {
+                        "name": p.get("name"),
+                        "type": "Pod",
+                        "namespace": p.get("namespace"),
+                        "cpu_usage": p.get("cpu_usage")
+                    }
+                    pods.append(pod_info)
+                    
+                    # Find relationship to deployment
+                    deployment_rel_query = """
+                    MATCH (p:Pod {name: $pod_name, namespace: $namespace})-[:PART_OF]->(d:Deployment)
+                    RETURN d.name as deployment_name
+                    """
+                    deployment_rel = self.neo4j_db.execute_query(
+                        deployment_rel_query, 
+                        {"pod_name": p.get("name"), "namespace": namespace}
+                    )
+                    
+                    if deployment_rel and deployment_rel[0].get('deployment_name'):
+                        pod_relationships.append({
+                            "source": p.get("name"),
+                            "target": deployment_rel[0].get('deployment_name'),
+                            "type": "PART_OF"
+                        })
+            
+            # Combine all data for visualization
+            visualization_data = {
+                "namespace": ns_info,
+                "resources": {
+                    "deployments": deployments,
+                    "pods": pods
+                },
+                "relationships": pod_relationships
+            }
+            
+            return {
+                "visualization_data": visualization_data,
+                "message": f"Successfully retrieved resource relationships for namespace '{namespace}'."
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to visualize resources: {str(e)}"}
+    
+    def _handle_describe_deployment(self, namespace, deployment_name):
+        """
+        Handle describing a deployment in a specific namespace.
+        
+        Args:
+            namespace: The namespace containing the deployment
+            deployment_name: The name of the deployment to describe
+            
+        Returns:
+            Dictionary with deployment description or error message
+        """
+        if not namespace or not deployment_name:
+            return {"error": "Namespace and deployment name must be specified."}
+            
+        try:
+            # Get the deployment description
+            description = self.k8s_client.get_deployment_description(deployment_name, namespace)
+            
+            if "error" in description:
+                return description
+                
+            # Format the description as a table-friendly structure
+            formatted_description = {
+                "basic_info": {
+                    "Name": description["name"],
+                    "Namespace": description["namespace"],
+                    "CreationTimestamp": description["creation_timestamp"],
+                    "Selector": ", ".join([f"{k}={v}" for k, v in description["selector"].items()]) if description["selector"] else "None"
+                },
+                "replicas": {
+                    "Desired": description["replicas"]["desired"],
+                    "Current": description["replicas"]["current"],
+                    "Updated": description["replicas"]["updated"],
+                    "Available": description["replicas"]["available"],
+                    "Unavailable": description["replicas"]["unavailable"] if description["replicas"]["unavailable"] else 0
+                },
+                "strategy": {
+                    "Type": description["strategy"]["type"],
+                    "RollingUpdate": {
+                        "MaxSurge": str(description["strategy"]["rolling_update"]["max_surge"]) if description["strategy"]["rolling_update"] and description["strategy"]["rolling_update"]["max_surge"] else "N/A",
+                        "MaxUnavailable": str(description["strategy"]["rolling_update"]["max_unavailable"]) if description["strategy"]["rolling_update"] and description["strategy"]["rolling_update"]["max_unavailable"] else "N/A"
+                    } if description["strategy"]["rolling_update"] else {"MaxSurge": "N/A", "MaxUnavailable": "N/A"}
+                },
+                "containers": [
+                    {
+                        "Name": container["name"],
+                        "Image": container["image"],
+                        "Ports": ", ".join([f"{p['container_port']}/{p['protocol']}" for p in container["ports"]]) if container["ports"] else "None",
+                        "Resources": {
+                            "Limits": ", ".join([f"{k}: {v}" for k, v in container["resources"]["limits"].items()]) if container["resources"]["limits"] else "None",
+                            "Requests": ", ".join([f"{k}: {v}" for k, v in container["resources"]["requests"].items()]) if container["resources"]["requests"] else "None"
+                        }
+                    }
+                    for container in description["containers"]
+                ],
+                "pods": [
+                    {
+                        "Name": pod["name"],
+                        "Status": pod["status"],
+                        "Ready": "Yes" if pod["ready"] else "No",
+                        "Restarts": pod["restart_count"],
+                        "Node": pod["node"] if pod["node"] else "N/A",
+                        "IP": pod["ip"] if pod["ip"] else "N/A"
+                    }
+                    for pod in description["pods"]
+                ],
+                "events": [
+                    {
+                        "Type": event["type"],
+                        "Reason": event["reason"],
+                        "Message": event["message"],
+                        "Count": event["count"],
+                        "LastSeen": event["last_timestamp"]
+                    }
+                    for event in description["events"]
+                ]
+            }
+            
+            return {
+                "deployment_description": formatted_description,
+                "message": f"Successfully retrieved description for deployment '{deployment_name}' in namespace '{namespace}'."
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to describe deployment: {str(e)}"}
+    
+    def _handle_create_namespace(self, namespace):
+        """
+        Handle creating a new namespace.
+        
+        Args:
+            namespace: The name of the namespace to create
+            
+        Returns:
+            Dictionary with namespace information or error message
+        """
+        if not namespace:
+            return {"error": "Namespace name must be specified."}
+            
+        try:
+            # Create the namespace
+            result = self.k8s_client.create_namespace(namespace)
+            
+            if "error" in result:
+                return result
+                
+            return {
+                "namespace_info": result,
+                "message": f"Successfully created namespace '{namespace}'."
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to create namespace: {str(e)}"}

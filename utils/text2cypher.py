@@ -1,18 +1,17 @@
 """
-Text2Cypher utility for converting natural language to Cypher queries.
+Text2Cypher module for converting natural language to Cypher queries.
 """
 import os
-from langchain.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain.chains import LLMChain
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
 
 # Load environment variables
 load_dotenv()
 
 class Text2Cypher:
     """
-    Utility for converting natural language to Cypher queries using LangChain.
+    Text2Cypher converter for Neo4j.
     """
     def __init__(self):
         """Initialize the Text2Cypher converter."""
@@ -22,64 +21,74 @@ class Text2Cypher:
         
         # Initialize the language model
         self.llm = ChatOpenAI(
-            model_name="gpt-4",
-            temperature=0,
+            model_name="gpt-4o-mini",
+            temperature=0.1,
             openai_api_key=openai_api_key
         )
         
-        # Define the prompt template for Text2Cypher conversion
+        # Define the prompt template
         self.prompt_template = PromptTemplate(
             input_variables=["schema", "query"],
             template="""
-            You are a Cypher query generator for a Neo4j graph database that stores Kubernetes resources.
+            You are a Neo4j Cypher query generator. Your task is to convert natural language queries about Kubernetes resources into Cypher queries.
             
-            The graph schema is as follows:
-            {schema}
+            Here is the schema of the Neo4j graph database:
             
-            Convert the following natural language query into a Cypher query:
-            "{query}"
+            Nodes:
+            - Cluster: Properties (name)
+            - Namespace: Properties (name, status, creation_time)
+            - Deployment: Properties (name, namespace, replicas, cpu_usage)
+            - Pod: Properties (name, namespace, cpu_usage)
             
-            Return ONLY the Cypher query without any explanation or additional text.
+            Relationships:
+            - (Namespace)-[:BELONGS_TO]->(Cluster)
+            - (Deployment)-[:BELONGS_TO]->(Namespace)
+            - (Pod)-[:BELONGS_TO]->(Namespace)
+            - (Pod)-[:PART_OF]->(Deployment)
+            
+            Given the following natural language query, generate a Cypher query that will answer the question:
+            
+            Query: {query}
+            
+            Return only the Cypher query without any explanation or additional text.
             """
         )
         
-        # Create the LLMChain
-        self.chain = LLMChain(llm=self.llm, prompt=self.prompt_template)
-        
-        # Define the Kubernetes graph schema
-        self.k8s_schema = """
-        Nodes:
-        - (Cluster): Represents a Kubernetes cluster
-          Properties: name
-        
-        - (Namespace): Represents a Kubernetes namespace
-          Properties: name, status, creation_time
-        
-        - (Deployment): Represents a Kubernetes deployment
-          Properties: name, namespace, replicas, cpu_usage
-        
-        - (Pod): Represents a Kubernetes pod
-          Properties: name, namespace, cpu_usage
-        
-        Relationships:
-        - (Namespace)-[:BELONGS_TO]->(Cluster): Namespace belongs to a cluster
-        - (Deployment)-[:BELONGS_TO]->(Namespace): Deployment belongs to a namespace
-        - (Pod)-[:BELONGS_TO]->(Namespace): Pod belongs to a namespace
-        - (Pod)-[:PART_OF]->(Deployment): Pod is part of a deployment
-        """
+        # Create the chain using the modern approach
+        self.chain = self.prompt_template | self.llm
     
-    def convert_to_cypher(self, query):
+    def generate_cypher(self, query):
         """
-        Convert a natural language query to a Cypher query.
+        Generate a Cypher query from a natural language query.
         
         Args:
             query: Natural language query
             
         Returns:
-            Cypher query as a string
+            Cypher query
         """
-        result = self.chain.invoke({"schema": self.k8s_schema, "query": query})
-        return result["text"].strip()
+        # Define the schema (could be dynamically generated in the future)
+        schema = """
+        Nodes:
+        - Cluster: Properties (name)
+        - Namespace: Properties (name, status, creation_time)
+        - Deployment: Properties (name, namespace, replicas, cpu_usage)
+        - Pod: Properties (name, namespace, cpu_usage)
+        
+        Relationships:
+        - (Namespace)-[:BELONGS_TO]->(Cluster)
+        - (Deployment)-[:BELONGS_TO]->(Namespace)
+        - (Pod)-[:BELONGS_TO]->(Namespace)
+        - (Pod)-[:PART_OF]->(Deployment)
+        """
+        
+        # Generate the Cypher query
+        result = self.chain.invoke({"schema": schema, "query": query})
+        
+        # Extract the Cypher query from the result
+        cypher_query = result.content.strip()
+        
+        return cypher_query
     
     def get_cypher_for_namespace_info(self, cluster_name):
         """
@@ -92,7 +101,7 @@ class Text2Cypher:
             Cypher query as a string
         """
         query = f"Show me all namespaces in the cluster named {cluster_name}"
-        return self.convert_to_cypher(query)
+        return self.generate_cypher(query)
     
     def get_cypher_for_resource_usage(self, namespace):
         """
@@ -105,7 +114,7 @@ class Text2Cypher:
             Cypher query as a string
         """
         query = f"Which pod and deployment in the {namespace} namespace is using the most CPU?"
-        return self.convert_to_cypher(query)
+        return self.generate_cypher(query)
     
     def get_cypher_for_deployment_info(self, namespace, deployment_name):
         """
@@ -119,4 +128,4 @@ class Text2Cypher:
             Cypher query as a string
         """
         query = f"Show me information about the deployment named {deployment_name} in the {namespace} namespace"
-        return self.convert_to_cypher(query)
+        return self.generate_cypher(query)
