@@ -16,6 +16,8 @@ spec:
         app: k8s-ai-agent
     spec:
       serviceAccountName: k8s-ai-agent-sa
+      imagePullSecrets:
+        - name: ncr
       containers:
       - name: k8s-ai-agent
         image: 44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry/k8s-ai-agent:latest
