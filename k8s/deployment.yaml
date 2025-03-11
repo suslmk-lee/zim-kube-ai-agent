@@ -31,6 +31,9 @@ spec:
           limits:
             cpu: "500m"
             memory: "512Mi"
+        env:
+        - name: UVICORN_LOG_LEVEL
+          value: "warning"
         envFrom:
         - configMapRef:
             name: k8s-ai-agent-config
